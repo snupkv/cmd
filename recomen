@@ -1,414 +1,98 @@
-import { AwsSecretsManager } from './secretService';
-import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import { SecretServiceV2 } from './secretService';
+import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 
-vi.mock('@aws-sdk/client-secrets-manager', () => {
-  return {
-    SecretsManagerClient: vi.fn().mockImplementation(() => ({
-      config: {},
-      send: vi.fn(),
-    })),
-    GetSecretValueCommand: vi.fn(),
-  };
-});
-
-vi.mock('@aws-sdk/credential-providers', () => ({
-  fromEnv: vi.fn(),
+vi.mock('@aws-sdk/client-secrets-manager', () => ({
+  SecretsManagerClient: vi.fn(),
+  GetSecretValueCommand: vi.fn(),
 }));
 
-describe('AwsSecretsManager', () => {
+describe('SecretServiceV2 - readAllSecrets', () => {
+  const mockSend = vi.fn();
+
   beforeEach(() => {
     vi.clearAllMocks();
-    delete (AwsSecretsManager as any).instance;
-    delete (AwsSecretsManager as any).client;
+    (SecretServiceV2 as any).instance = undefined;
+    (SecretServiceV2 as any).client = undefined;
+    process.env = { ...process.env }; // Reset ENV
 
-    process.env = {
-      ...process.env,
-      AWS_REGION: 'us-east-1',
-      NODE_ENV: 'test',
-      CLIENT_ID: '',
-      CLIENT_SECRET: '',
-      HTTP_PROXY: '',
-    };
+    (SecretsManagerClient as unknown as vi.Mock).mockImplementation(() => ({
+      send: mockSend,
+    }));
   });
 
-  it('should initialize and return a singleton instance', () => {
-    const instance1 = AwsSecretsManager.getInstance();
-    const instance2 = AwsSecretsManager.getInstance();
+  it('should initialize SecretsManagerClient only once', () => {
+    process.env.AWS_REGION = 'us-east-1';
 
-    expect(instance1).toBe(instance2);
+    const svc = SecretServiceV2.getInstance();
+    svc.initializeClient();
+    svc.initializeClient();
+
+    expect(SecretsManagerClient).toHaveBeenCalledTimes(1);
   });
 
-  it('should initialize client with region', () => {
-    AwsSecretsManager['initializeClient']();
+  it('should fetch secrets from Secrets Manager and store in process.env', async () => {
+    process.env.AWS_REGION = 'us-east-1';
+    process.env['SECRET_MANAGER_KEY_1'] = 'cof/cos/BABAINTEGRATEDCHANNELMANAGEMENT/1/myParam';
 
-    expect(SecretsManagerClient).toHaveBeenCalledWith({
-      region: 'us-east-1',
+    mockSend.mockResolvedValue({
+      SecretString: JSON.stringify({ myParam: 'myValue' }),
     });
+
+    const svc = SecretServiceV2.getInstance();
+    await svc.readAllSecrets();
+
+    expect(mockSend).toHaveBeenCalledTimes(1);
+    expect(process.env['SECRET_MANAGER_KEY_1']).toBe('myValue');
   });
 
-  it('should set HTTP proxy if provided', () => {
-    process.env.HTTP_PROXY = 'http://proxy.test';
+  it('should skip SecretsManager if secret exists in process.env', async () => {
+    process.env['SECRET_MANAGER_KEY_1'] = 'cof/cos/BABAINTEGRATEDCHANNELMANAGEMENT/1/myParam';
+    process.env['myParam'] = 'preSet';
 
-    AwsSecretsManager['initializeClient']();
+    const svc = SecretServiceV2.getInstance();
+    await svc.readAllSecrets();
 
-    expect(AwsSecretsManager['client'].config.requestHandler).toBeDefined();
+    expect(mockSend).not.toHaveBeenCalled();
   });
 
-  it('should set credentials if AWS keys are provided', () => {
-    process.env.AWS_ACCESS_KEY_ID = 'key';
-    process.env.AWS_SECRET_ACCESS_KEY = 'secret';
-    process.env.AWS_SESSION_TOKEN = 'token';
+  it('should throw if Secrets Manager returns no SecretString', async () => {
+    process.env.AWS_REGION = 'us-east-1';
+    process.env['SECRET_MANAGER_KEY_1'] = 'cof/cos/BABAINTEGRATEDCHANNELMANAGEMENT/1/missingParam';
 
-    AwsSecretsManager['initializeClient']();
+    mockSend.mockResolvedValue({});
 
-    expect(AwsSecretsManager['client'].config.credentials).toBeDefined();
+    const svc = SecretServiceV2.getInstance();
+
+    await expect(svc.readAllSecrets()).rejects.toThrowError(/Error fetching secrets/);
   });
 
-  it('should return early if CLIENT_ID and CLIENT_SECRET are present', async () => {
-    process.env.CLIENT_ID = 'abc';
-    process.env.CLIENT_SECRET = 'xyz';
+  it('should throw if SecretString is invalid JSON', async () => {
+    process.env.AWS_REGION = 'us-east-1';
+    process.env['SECRET_MANAGER_KEY_1'] = 'cof/cos/BABAINTEGRATEDCHANNELMANAGEMENT/1/badJson';
 
-    const manager = AwsSecretsManager.getInstance();
-    const result = await manager.getSecretValue('test');
-
-    expect(result).toBeUndefined(); // Nothing happens since secrets exist
-  });
-
-  it('should fetch and set secrets if env is missing', async () => {
-    const secretData = { clientId: 'abc', clientSecret: 'xyz' };
-    const mockSend = vi.fn().mockResolvedValue({ SecretString: JSON.stringify(secretData) });
-    AwsSecretsManager['client'] = { send: mockSend } as any;
-
-    const manager = AwsSecretsManager.getInstance();
-    await manager.getSecretValue('test-secret');
-
-    expect(GetSecretValueCommand).toHaveBeenCalledWith({ SecretId: 'test-secret' });
-    expect(process.env.CLIENT_ID).toBe('abc');
-    expect(process.env.CLIENT_SECRET).toBe('xyz');
-  });
-
-  it('should throw and log error if secret fetch fails', async () => {
-    const error = new Error('Failed to fetch');
-    AwsSecretsManager['client'] = {
-      send: vi.fn().mockRejectedValue(error),
-    } as any;
-
-    const manager = AwsSecretsManager.getInstance();
-    const loggerSpy = vi.spyOn(manager['logger'], 'error');
-
-    await expect(manager.getSecretValue('bad-secret')).rejects.toThrow('Failed to fetch');
-    expect(loggerSpy).toHaveBeenCalledWith('Error fetching secret bad-secret: Error: Failed to fetch');
-  });
-});
-
-
-
-// secretService.spec.ts
-import { AwsSecretsManager } from './secretService';
-import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
-
-vi.mock('@aws-sdk/client-secrets-manager', () => {
-  return {
-    SecretsManagerClient: vi.fn().mockImplementation(() => ({
-      config: {},
-      send: vi.fn(),
-    })),
-    GetSecretValueCommand: vi.fn(),
-  };
-});
-
-vi.mock('@aws-sdk/credential-providers', () => ({
-  fromEnv: vi.fn(),
-}));
-
-describe('AwsSecretsManager', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    delete (AwsSecretsManager as any).instance;
-    delete (AwsSecretsManager as any).client;
-
-    process.env = {
-      ...process.env,
-      AWS_REGION: 'us-east-1',
-      NODE_ENV: 'test',
-      CLIENT_ID: '',
-      CLIENT_SECRET: '',
-      HTTP_PROXY: '',
-    };
-  });
-
-  it('should initialize and return a singleton instance', () => {
-    const instance1 = AwsSecretsManager.getInstance();
-    const instance2 = AwsSecretsManager.getInstance();
-
-    expect(instance1).toBe(instance2);
-  });
-
-  it('should initialize client with region', () => {
-    AwsSecretsManager['initializeClient']();
-
-    expect(SecretsManagerClient).toHaveBeenCalledWith({
-      region: 'us-east-1',
+    mockSend.mockResolvedValue({
+      SecretString: 'not-a-valid-json',
     });
+
+    const svc = SecretServiceV2.getInstance();
+
+    await expect(svc.readAllSecrets()).rejects.toThrowError(/Error fetching secrets/);
   });
 
-  it('should set HTTP proxy if provided', () => {
-    process.env.HTTP_PROXY = 'http://proxy.test';
+  it('should log and throw on fetch error', async () => {
+    process.env.AWS_REGION = 'us-east-1';
+    process.env['SECRET_MANAGER_KEY_1'] = 'cof/cos/BABAINTEGRATEDCHANNELMANAGEMENT/1/param';
 
-    AwsSecretsManager['initializeClient']();
+    const mockError = new Error('AWS error');
+    mockSend.mockRejectedValue(mockError);
 
-    expect(AwsSecretsManager['client'].config.requestHandler).toBeDefined();
-  });
-
-  it('should set credentials if AWS keys are provided', () => {
-    process.env.AWS_ACCESS_KEY_ID = 'key';
-    process.env.AWS_SECRET_ACCESS_KEY = 'secret';
-    process.env.AWS_SESSION_TOKEN = 'token';
-
-    AwsSecretsManager['initializeClient']();
-
-    expect(AwsSecretsManager['client'].config.credentials).toBeDefined();
-  });
-
-  it('should return early if CLIENT_ID and CLIENT_SECRET are present', async () => {
-    process.env.CLIENT_ID = 'abc';
-    process.env.CLIENT_SECRET = 'xyz';
-
-    const manager = AwsSecretsManager.getInstance();
-    const result = await manager.getSecretValue('test');
-
-    expect(result).toBeUndefined(); // Nothing happens since secrets exist
-  });
-
-  it('should fetch and set secrets if env is missing', async () => {
-    const secretData = { clientId: 'abc', clientSecret: 'xyz' };
-    const mockSend = vi.fn().mockResolvedValue({ SecretString: JSON.stringify(secretData) });
-    AwsSecretsManager['client'] = { send: mockSend } as any;
-
-    const manager = AwsSecretsManager.getInstance();
-    await manager.getSecretValue('test-secret');
-
-    expect(GetSecretValueCommand).toHaveBeenCalledWith({ SecretId: 'test-secret' });
-    expect(process.env.CLIENT_ID).toBe('abc');
-    expect(process.env.CLIENT_SECRET).toBe('xyz');
-  });
-
-  it('should throw and log error if secret fetch fails', async () => {
-    const error = new Error('Failed to fetch');
-    AwsSecretsManager['client'] = {
-      send: vi.fn().mockRejectedValue(error),
-    } as any;
-
-    const manager = AwsSecretsManager.getInstance();
-    const loggerSpy = vi.spyOn(manager['logger'], 'error');
-
-    await expect(manager.getSecretValue('bad-secret')).rejects.toThrow('Failed to fetch');
-    expect(loggerSpy).toHaveBeenCalledWith('Error fetching secret bad-secret: Error: Failed to fetch');
-  });
-});
-// secretService.spec.ts
-import { AwsSecretsManager } from './secretService';
-import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
-
-vi.mock('@aws-sdk/client-secrets-manager', () => {
-  return {
-    SecretsManagerClient: vi.fn().mockImplementation(() => ({
-      config: {},
-      send: vi.fn(),
-    })),
-    GetSecretValueCommand: vi.fn(),
-  };
-});
-
-vi.mock('@aws-sdk/credential-providers', () => ({
-  fromEnv: vi.fn(),
-}));
-
-describe('AwsSecretsManager', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    delete (AwsSecretsManager as any).instance;
-    delete (AwsSecretsManager as any).client;
-
-    process.env = {
-      ...process.env,
-      AWS_REGION: 'us-east-1',
-      NODE_ENV: 'test',
-      CLIENT_ID: '',
-      CLIENT_SECRET: '',
-      HTTP_PROXY: '',
-    };
-  });
-
-  it('should initialize and return a singleton instance', () => {
-    const instance1 = AwsSecretsManager.getInstance();
-    const instance2 = AwsSecretsManager.getInstance();
-
-    expect(instance1).toBe(instance2);
-  });
-
-  it('should initialize client with region', () => {
-    AwsSecretsManager['initializeClient']();
-
-    expect(SecretsManagerClient).toHaveBeenCalledWith({
-      region: 'us-east-1',
+    const svc = SecretServiceV2.getInstance();
+    const spyLogger = vi.spyOn(svc as any, 'logger', 'get').mockReturnValue({
+      error: vi.fn(),
     });
-  });
 
-  it('should set HTTP proxy if provided', () => {
-    process.env.HTTP_PROXY = 'http://proxy.test';
+    await expect(svc.readAllSecrets()).rejects.toThrowError(/AWS error/);
 
-    AwsSecretsManager['initializeClient']();
-
-    expect(AwsSecretsManager['client'].config.requestHandler).toBeDefined();
-  });
-
-  it('should set credentials if AWS keys are provided', () => {
-    process.env.AWS_ACCESS_KEY_ID = 'key';
-    process.env.AWS_SECRET_ACCESS_KEY = 'secret';
-    process.env.AWS_SESSION_TOKEN = 'token';
-
-    AwsSecretsManager['initializeClient']();
-
-    expect(AwsSecretsManager['client'].config.credentials).toBeDefined();
-  });
-
-  it('should return early if CLIENT_ID and CLIENT_SECRET are present', async () => {
-    process.env.CLIENT_ID = 'abc';
-    process.env.CLIENT_SECRET = 'xyz';
-
-    const manager = AwsSecretsManager.getInstance();
-    const result = await manager.getSecretValue('test');
-
-    expect(result).toBeUndefined(); // Nothing happens since secrets exist
-  });
-
-  it('should fetch and set secrets if env is missing', async () => {
-    const secretData = { clientId: 'abc', clientSecret: 'xyz' };
-    const mockSend = vi.fn().mockResolvedValue({ SecretString: JSON.stringify(secretData) });
-    AwsSecretsManager['client'] = { send: mockSend } as any;
-
-    const manager = AwsSecretsManager.getInstance();
-    await manager.getSecretValue('test-secret');
-
-    expect(GetSecretValueCommand).toHaveBeenCalledWith({ SecretId: 'test-secret' });
-    expect(process.env.CLIENT_ID).toBe('abc');
-    expect(process.env.CLIENT_SECRET).toBe('xyz');
-  });
-
-  it('should throw and log error if secret fetch fails', async () => {
-    const error = new Error('Failed to fetch');
-    AwsSecretsManager['client'] = {
-      send: vi.fn().mockRejectedValue(error),
-    } as any;
-
-    const manager = AwsSecretsManager.getInstance();
-    const loggerSpy = vi.spyOn(manager['logger'], 'error');
-
-    await expect(manager.getSecretValue('bad-secret')).rejects.toThrow('Failed to fetch');
-    expect(loggerSpy).toHaveBeenCalledWith('Error fetching secret bad-secret: Error: Failed to fetch');
-  });
-});
-// secretService.spec.ts
-import { AwsSecretsManager } from './secretService';
-import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
-
-vi.mock('@aws-sdk/client-secrets-manager', () => {
-  return {
-    SecretsManagerClient: vi.fn().mockImplementation(() => ({
-      config: {},
-      send: vi.fn(),
-    })),
-    GetSecretValueCommand: vi.fn(),
-  };
-});
-
-vi.mock('@aws-sdk/credential-providers', () => ({
-  fromEnv: vi.fn(),
-}));
-
-describe('AwsSecretsManager', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    delete (AwsSecretsManager as any).instance;
-    delete (AwsSecretsManager as any).client;
-
-    process.env = {
-      ...process.env,
-      AWS_REGION: 'us-east-1',
-      NODE_ENV: 'test',
-      CLIENT_ID: '',
-      CLIENT_SECRET: '',
-      HTTP_PROXY: '',
-    };
-  });
-
-  it('should initialize and return a singleton instance', () => {
-    const instance1 = AwsSecretsManager.getInstance();
-    const instance2 = AwsSecretsManager.getInstance();
-
-    expect(instance1).toBe(instance2);
-  });
-
-  it('should initialize client with region', () => {
-    AwsSecretsManager['initializeClient']();
-
-    expect(SecretsManagerClient).toHaveBeenCalledWith({
-      region: 'us-east-1',
-    });
-  });
-
-  it('should set HTTP proxy if provided', () => {
-    process.env.HTTP_PROXY = 'http://proxy.test';
-
-    AwsSecretsManager['initializeClient']();
-
-    expect(AwsSecretsManager['client'].config.requestHandler).toBeDefined();
-  });
-
-  it('should set credentials if AWS keys are provided', () => {
-    process.env.AWS_ACCESS_KEY_ID = 'key';
-    process.env.AWS_SECRET_ACCESS_KEY = 'secret';
-    process.env.AWS_SESSION_TOKEN = 'token';
-
-    AwsSecretsManager['initializeClient']();
-
-    expect(AwsSecretsManager['client'].config.credentials).toBeDefined();
-  });
-
-  it('should return early if CLIENT_ID and CLIENT_SECRET are present', async () => {
-    process.env.CLIENT_ID = 'abc';
-    process.env.CLIENT_SECRET = 'xyz';
-
-    const manager = AwsSecretsManager.getInstance();
-    const result = await manager.getSecretValue('test');
-
-    expect(result).toBeUndefined(); // Nothing happens since secrets exist
-  });
-
-  it('should fetch and set secrets if env is missing', async () => {
-    const secretData = { clientId: 'abc', clientSecret: 'xyz' };
-    const mockSend = vi.fn().mockResolvedValue({ SecretString: JSON.stringify(secretData) });
-    AwsSecretsManager['client'] = { send: mockSend } as any;
-
-    const manager = AwsSecretsManager.getInstance();
-    await manager.getSecretValue('test-secret');
-
-    expect(GetSecretValueCommand).toHaveBeenCalledWith({ SecretId: 'test-secret' });
-    expect(process.env.CLIENT_ID).toBe('abc');
-    expect(process.env.CLIENT_SECRET).toBe('xyz');
-  });
-
-  it('should throw and log error if secret fetch fails', async () => {
-    const error = new Error('Failed to fetch');
-    AwsSecretsManager['client'] = {
-      send: vi.fn().mockRejectedValue(error),
-    } as any;
-
-    const manager = AwsSecretsManager.getInstance();
-    const loggerSpy = vi.spyOn(manager['logger'], 'error');
-
-    await expect(manager.getSecretValue('bad-secret')).rejects.toThrow('Failed to fetch');
-    expect(loggerSpy).toHaveBeenCalledWith('Error fetching secret bad-secret: Error: Failed to fetch');
+    expect(spyLogger().error).toHaveBeenCalledWith(expect.stringContaining('Error fetching secrets'));
   });
 });
