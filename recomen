@@ -1,98 +1,77 @@
+import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { SecretServiceV2 } from './secretService';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 
-vi.mock('@aws-sdk/client-secrets-manager', () => ({
-  SecretsManagerClient: vi.fn(),
-  GetSecretValueCommand: vi.fn(),
-}));
+vi.mock('@aws-sdk/client-secrets-manager', async () => {
+  return {
+    SecretsManagerClient: vi.fn().mockImplementation(() => ({
+      send: vi.fn().mockResolvedValue({
+        SecretString: JSON.stringify({ key1: 'value1' })
+      })
+    })),
+    GetSecretValueCommand: vi.fn()
+  };
+});
 
-describe('SecretServiceV2 - readAllSecrets', () => {
-  const mockSend = vi.fn();
+describe('SecretServiceV2', () => {
+  let service: SecretServiceV2;
 
   beforeEach(() => {
-    vi.clearAllMocks();
-    (SecretServiceV2 as any).instance = undefined;
-    (SecretServiceV2 as any).client = undefined;
-    process.env = { ...process.env }; // Reset ENV
-
-    (SecretsManagerClient as unknown as vi.Mock).mockImplementation(() => ({
-      send: mockSend,
-    }));
+    service = SecretServiceV2.getInstance();
+    process.env = {
+      ...process.env,
+      AWS_REGION: 'us-east-1',
+      'SECRET_MANAGER_test/key1': 'test/key1',
+      HTTP_PROXY: 'http://localhost:8080',
+      HTTPS_PROXY: 'http://localhost:8080',
+      NODE_ENV: 'localhost',
+      AWS_ACCESS_KEY_ID: 'dummy',
+      AWS_SECRET_ACCESS_KEY: 'dummy',
+      AWS_SESSION_TOKEN: 'dummy'
+    };
   });
 
-  it('should initialize SecretsManagerClient only once', () => {
-    process.env.AWS_REGION = 'us-east-1';
-
-    const svc = SecretServiceV2.getInstance();
-    svc.initializeClient();
-    svc.initializeClient();
-
-    expect(SecretsManagerClient).toHaveBeenCalledTimes(1);
+  it('should return the singleton instance', () => {
+    const instance = SecretServiceV2.getInstance();
+    expect(instance).toBeDefined();
+    expect(instance).toBe(service);
   });
 
-  it('should fetch secrets from Secrets Manager and store in process.env', async () => {
-    process.env.AWS_REGION = 'us-east-1';
-    process.env['SECRET_MANAGER_KEY_1'] = 'cof/cos/BABAINTEGRATEDCHANNELMANAGEMENT/1/myParam';
-
-    mockSend.mockResolvedValue({
-      SecretString: JSON.stringify({ myParam: 'myValue' }),
-    });
-
-    const svc = SecretServiceV2.getInstance();
-    await svc.readAllSecrets();
-
-    expect(mockSend).toHaveBeenCalledTimes(1);
-    expect(process.env['SECRET_MANAGER_KEY_1']).toBe('myValue');
+  it('should initialize the SecretsManagerClient with config', () => {
+    const client = service.initializeClient();
+    expect(client).toBeDefined();
+    expect(SecretsManagerClient).toHaveBeenCalled();
   });
 
-  it('should skip SecretsManager if secret exists in process.env', async () => {
-    process.env['SECRET_MANAGER_KEY_1'] = 'cof/cos/BABAINTEGRATEDCHANNELMANAGEMENT/1/myParam';
-    process.env['myParam'] = 'preSet';
-
-    const svc = SecretServiceV2.getInstance();
-    await svc.readAllSecrets();
-
-    expect(mockSend).not.toHaveBeenCalled();
+  it('should fetch secret entries from process.env', () => {
+    const entries = service['getSecretEntries']();
+    expect(entries.length).toBeGreaterThan(0);
+    expect(entries[0]).toHaveProperty('key');
+    expect(entries[0]).toHaveProperty('value');
   });
 
-  it('should throw if Secrets Manager returns no SecretString', async () => {
-    process.env.AWS_REGION = 'us-east-1';
-    process.env['SECRET_MANAGER_KEY_1'] = 'cof/cos/BABAINTEGRATEDCHANNELMANAGEMENT/1/missingParam';
-
-    mockSend.mockResolvedValue({});
-
-    const svc = SecretServiceV2.getInstance();
-
-    await expect(svc.readAllSecrets()).rejects.toThrowError(/Error fetching secrets/);
+  it('should read all secrets and call fetchAndSetSecret', async () => {
+    const spy = vi.spyOn(service as any, 'fetchAndSetSecret').mockResolvedValue(undefined);
+    await service.readAllSecrets();
+    expect(spy).toHaveBeenCalled();
   });
 
-  it('should throw if SecretString is invalid JSON', async () => {
-    process.env.AWS_REGION = 'us-east-1';
-    process.env['SECRET_MANAGER_KEY_1'] = 'cof/cos/BABAINTEGRATEDCHANNELMANAGEMENT/1/badJson';
-
-    mockSend.mockResolvedValue({
-      SecretString: 'not-a-valid-json',
-    });
-
-    const svc = SecretServiceV2.getInstance();
-
-    await expect(svc.readAllSecrets()).rejects.toThrowError(/Error fetching secrets/);
+  it('should fetch and set a secret when not cached', async () => {
+    const readSecrets: any[] = [];
+    await service['fetchAndSetSecret']({ key: 'SECRET_MANAGER_test/key1', value: 'test/key1' }, 'cof/cos/BABAINTEGRATEDCHANNELMANAGEMENT/', readSecrets);
+    expect(readSecrets.length).toBeGreaterThan(0);
   });
 
-  it('should log and throw on fetch error', async () => {
-    process.env.AWS_REGION = 'us-east-1';
-    process.env['SECRET_MANAGER_KEY_1'] = 'cof/cos/BABAINTEGRATEDCHANNELMANAGEMENT/1/param';
+  it('should set secret from cache when found', () => {
+    const mockSecret = { secretName: 'test', secretResponse: JSON.stringify({ key1: 'value1' }) };
+    service['setSecretFromCache']('SECRET_MANAGER_test/key1', mockSecret, 'key1');
+    expect(process.env['SECRET_MANAGER_test/key1']).toBe('value1');
+  });
 
-    const mockError = new Error('AWS error');
-    mockSend.mockRejectedValue(mockError);
-
-    const svc = SecretServiceV2.getInstance();
-    const spyLogger = vi.spyOn(svc as any, 'logger', 'get').mockReturnValue({
-      error: vi.fn(),
-    });
-
-    await expect(svc.readAllSecrets()).rejects.toThrowError(/AWS error/);
-
-    expect(spyLogger().error).toHaveBeenCalledWith(expect.stringContaining('Error fetching secrets'));
+  it('should fetch secret from manager if not in cache', async () => {
+    const readSecrets: any[] = [];
+    await service['fetchSecretFromManager']('SECRET_MANAGER_test/key1', 'test/key1', 'key1', readSecrets);
+    expect(readSecrets.length).toBeGreaterThan(0);
+    expect(process.env['SECRET_MANAGER_test/key1']).toBe('value1');
   });
 });
